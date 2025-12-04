@@ -8,7 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-lynx/lynx/app/log"
+	"github.com/go-lynx/lynx"
+	"github.com/go-lynx/lynx/log"
 	"github.com/go-lynx/lynx/plugins"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -19,6 +20,10 @@ const (
 	pluginVersion     = "v1.0.0"
 	pluginDescription = "etcd distributed lock plugin for lynx framework"
 	confPrefix        = "lynx.etcd-lock"
+
+	// etcd plugin dependency
+	etcdPluginName    = "etcd.config.center"
+	etcdPluginVersion = "v1.0.0"
 )
 
 // PlugEtcdLock represents an etcd distributed lock plugin instance
@@ -46,29 +51,14 @@ func NewEtcdLockPlugin() *PlugEtcdLock {
 
 // InitializeResources implements custom initialization logic
 func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
-	// Get etcd client from etcd config center plugin
-	// This assumes etcd config center plugin is loaded first
-	etcdPlugin := rt.GetPlugin("etcd.config.center")
-	if etcdPlugin == nil {
-		return fmt.Errorf("etcd config center plugin not found, please load it first")
-	}
-
-	// Try to get client from etcd plugin
-	if plugEtcd, ok := etcdPlugin.(interface{ GetClient() *clientv3.Client }); ok {
-		p.client = plugEtcd.GetClient()
-		if p.client == nil {
-			return fmt.Errorf("etcd client is nil")
-		}
-	} else {
-		return fmt.Errorf("etcd plugin does not provide client")
-	}
-
-	// Set global client getter
-	GetEtcdClient = func() *clientv3.Client {
-		return p.client
-	}
-
-	log.Infof("Etcd lock plugin initialized successfully")
+	// Declare dependency on etcd config center plugin
+	p.AddDependency(plugins.Dependency{
+		ID:          plugins.GeneratePluginID("", etcdPluginName, etcdPluginVersion),
+		Name:        etcdPluginName,
+		Type:        plugins.DependencyTypeRequired,
+		Required:    true,
+		Description: "Etcd configuration center plugin is required for distributed lock functionality",
+	})
 	return nil
 }
 
@@ -81,12 +71,40 @@ func (p *PlugEtcdLock) StartupTasks() error {
 		return fmt.Errorf("etcd lock plugin already initialized")
 	}
 
-	if p.client == nil {
-		return fmt.Errorf("etcd client is nil")
+	// Get etcd client from etcd config center plugin
+	// The dependency system ensures etcd plugin is loaded and started first
+	manager := lynx.Lynx().GetPluginManager()
+	if manager == nil {
+		return fmt.Errorf("plugin manager not initialized")
+	}
+
+	etcdPlugin := manager.GetPlugin(etcdPluginName)
+	if etcdPlugin == nil {
+		return fmt.Errorf("etcd config center plugin (%s) not found, please ensure it is configured and loaded", etcdPluginName)
+	}
+
+	// Check if etcd plugin has started successfully by checking its status
+	if status := etcdPlugin.Status(etcdPlugin); status != plugins.StatusActive {
+		return fmt.Errorf("etcd config center plugin is not active (status: %v), please check its initialization", status)
+	}
+
+	// Try to get client from etcd plugin
+	if plugEtcd, ok := etcdPlugin.(interface{ GetClient() *clientv3.Client }); ok {
+		p.client = plugEtcd.GetClient()
+		if p.client == nil {
+			return fmt.Errorf("etcd client is nil, etcd plugin may not have initialized properly")
+		}
+	} else {
+		return fmt.Errorf("etcd plugin does not implement GetClient() method")
+	}
+
+	// Set global client getter
+	GetEtcdClient = func() *clientv3.Client {
+		return p.client
 	}
 
 	atomic.StoreInt32(&p.initialized, 1)
-	log.Infof("Etcd lock plugin started successfully")
+	log.Infof("Etcd lock plugin started successfully with etcd client connection")
 	return nil
 }
 
