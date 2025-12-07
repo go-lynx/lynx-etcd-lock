@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-lynx/lynx/app/log"
+	"github.com/go-lynx/lynx/log"
 	"github.com/go-lynx/lynx/plugins"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -48,9 +48,12 @@ func NewEtcdLockPlugin() *PlugEtcdLock {
 func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
 	// Get etcd client from etcd config center plugin
 	// This assumes etcd config center plugin is loaded first
-	etcdPlugin := rt.GetPlugin("etcd.config.center")
+	etcdPlugin, err := rt.GetResource("etcd.config.center")
+	if err != nil {
+		return fmt.Errorf("etcd config center plugin not found, please load it first: %w", err)
+	}
 	if etcdPlugin == nil {
-		return fmt.Errorf("etcd config center plugin not found, please load it first")
+		return fmt.Errorf("etcd config center plugin resource is nil")
 	}
 
 	// Try to get client from etcd plugin
