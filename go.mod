@@ -3,7 +3,7 @@ module github.com/go-lynx/lynx/plugins/etcd-lock
 go 1.25
 
 require (
-	github.com/go-lynx/lynx v1.2.3
+	github.com/go-lynx/lynx v1.5.0
 	go.etcd.io/etcd/client/v3 v3.5.13
 )
 
@@ -28,4 +28,5 @@ require (
 	google.golang.org/grpc v1.71.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 )
+
 
