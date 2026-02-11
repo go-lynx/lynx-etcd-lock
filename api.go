@@ -3,6 +3,7 @@ package etcdlock
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-lynx/lynx/log"
@@ -69,23 +70,17 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 		lock.EnableAutoRenew(options)
 	}
 
-	// Ensure final release
+	// Ensure final release - use Background to avoid caller ctx cancellation blocking release
 	defer func() {
-		rctx := ctx
-		var cancel context.CancelFunc
 		to := options.OperationTimeout
 		if to <= 0 {
 			to = DefaultLockOptions.OperationTimeout
 		}
-		if to > 0 {
-			rctx, cancel = context.WithTimeout(ctx, to)
-		}
+		rctx, cancel := context.WithTimeout(context.Background(), to)
+		defer cancel()
 		start := time.Now()
 		if releaseErr := lock.Release(rctx); releaseErr != nil {
 			log.ErrorCtx(ctx, "failed to release etcd lock", "error", releaseErr)
-		}
-		if cancel != nil {
-			cancel()
 		}
 		observeOperationLatency("unlock", time.Since(start))
 	}()
@@ -114,11 +109,23 @@ func NewLockFromClient(ctx context.Context, key string, options LockOptions) (*E
 	return NewLock(ctx, client, key, options)
 }
 
-// EnableAutoRenew registers the current lock to the global renewal manager
+// EnableAutoRenew registers the current lock to the global renewal manager.
+// Cancels per-lock keepAlive if running (manager handles renewal instead).
 func (el *EtcdLock) EnableAutoRenew(options LockOptions) {
+	// Stop per-lock keepAlive - manager renewal takes over
+	el.mutex.Lock()
+	if el.cancel != nil {
+		el.cancel()
+		el.cancel = nil
+		el.ctx = nil
+	}
+	el.mutex.Unlock()
+
 	globalLockManager.mutex.Lock()
 	if _, exists := globalLockManager.locks[el.key]; !exists {
 		globalLockManager.locks[el.key] = el
+		atomic.AddInt64(&globalLockManager.stats.ActiveLocks, 1)
+		atomic.AddInt64(&globalLockManager.stats.TotalLocks, 1)
 	}
 	globalLockManager.mutex.Unlock()
 	globalLockManager.startRenewalService(options)

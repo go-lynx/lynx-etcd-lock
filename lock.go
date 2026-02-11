@@ -59,58 +59,70 @@ func (el *EtcdLock) IsExpired() bool {
 	return time.Now().After(el.expiresAt)
 }
 
-// Renew manually renews the lock
+// Renew manually renews the lock by extending the existing lease via KeepAliveOnce.
 func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) error {
 	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	leaseID := el.leaseID
+	el.mutex.Unlock()
 
-	if el.leaseID == 0 {
+	if leaseID == 0 {
 		return ErrLockNotHeld
 	}
 
-	// Create new lease with new expiration
-	lease, err := el.client.Grant(ctx, int64(newExpiration.Seconds()))
-	if err != nil {
-		globalCallback.OnLockRenewalFailed(el.key, err)
-		return fmt.Errorf("failed to grant lease: %w", err)
-	}
-
-	// Keep alive the new lease
-	_, err = el.client.KeepAliveOnce(ctx, lease.ID)
+	// Extend the existing lease (key is bound to this lease)
+	resp, err := el.client.KeepAliveOnce(ctx, leaseID)
 	if err != nil {
 		globalCallback.OnLockRenewalFailed(el.key, err)
 		return fmt.Errorf("failed to keep alive lease: %w", err)
 	}
 
-	// Update lease ID and expiration
-	el.leaseID = lease.ID
-	el.expiration = newExpiration
-	el.expiresAt = time.Now().Add(newExpiration)
+	el.mutex.Lock()
+	defer el.mutex.Unlock()
 
-	globalCallback.OnLockRenewed(el.key, newExpiration)
+	// Update local expiration tracking; etcd lease TTL stays as originally granted
+	if newExpiration > 0 {
+		el.expiration = newExpiration
+	}
+	el.expiresAt = time.Now().Add(time.Duration(resp.TTL) * time.Second)
+
+	globalCallback.OnLockRenewed(el.key, el.expiration)
 	return nil
 }
 
 // Release releases the lock
 func (el *EtcdLock) Release(ctx context.Context) error {
 	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	leaseID := el.leaseID
+	cancel := el.cancel
+	el.mutex.Unlock()
 
-	if el.leaseID == 0 {
+	if leaseID == 0 {
 		return ErrLockNotHeld
 	}
 
+	// Cancel keepAlive goroutine first to avoid goroutine leak
+	if cancel != nil {
+		cancel()
+		el.mutex.Lock()
+		el.cancel = nil
+		el.ctx = nil
+		el.mutex.Unlock()
+	}
+
+	// Remove from global manager before revoke (avoids spurious renewal retries)
+	globalLockManager.removeLock(el.key)
+
 	// Revoke the lease to release the lock
-	_, err := el.client.Revoke(ctx, el.leaseID)
+	_, err := el.client.Revoke(ctx, leaseID)
 	if err != nil {
 		return fmt.Errorf("failed to revoke lease: %w", err)
 	}
 
+	el.mutex.Lock()
 	duration := time.Since(el.acquiredAt)
 	globalCallback.OnLockReleased(el.key, duration)
-
-	// Reset lease ID
 	el.leaseID = 0
+	el.mutex.Unlock()
 
 	return nil
 }
@@ -153,13 +165,17 @@ func (el *EtcdLock) Acquire(ctx context.Context) error {
 
 	txnResp, err := txn.Commit()
 	if err != nil {
-		el.client.Revoke(context.Background(), lease.ID)
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		el.client.Revoke(revokeCtx, lease.ID)
+		revokeCancel()
 		globalCallback.OnLockAcquireFailed(el.key, err)
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	if !txnResp.Succeeded {
-		el.client.Revoke(context.Background(), lease.ID)
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		el.client.Revoke(revokeCtx, lease.ID)
+		revokeCancel()
 		globalCallback.OnLockAcquireFailed(el.key, ErrLockAcquireConflict)
 		return ErrLockAcquireConflict
 	}

@@ -89,6 +89,16 @@ func (lm *lockManager) startRenewalService(options LockOptions) {
 	}()
 }
 
+// removeLock removes a lock from the manager and updates stats
+func (lm *lockManager) removeLock(key string) {
+	lm.mutex.Lock()
+	if _, exists := lm.locks[key]; exists {
+		delete(lm.locks, key)
+		atomic.AddInt64(&lm.stats.ActiveLocks, -1)
+	}
+	lm.mutex.Unlock()
+}
+
 // stopRenewalService stops the renewal service
 func (lm *lockManager) stopRenewalService() {
 	lm.mutex.Lock()
@@ -179,8 +189,10 @@ func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
 	}
 
 	lm.mutex.Lock()
-	delete(lm.locks, lock.key)
-	atomic.AddInt64(&lm.stats.ActiveLocks, -1)
+	if _, exists := lm.locks[lock.key]; exists {
+		delete(lm.locks, lock.key)
+		atomic.AddInt64(&lm.stats.ActiveLocks, -1)
+	}
 	lm.mutex.Unlock()
 
 	log.ErrorCtx(context.Background(), "lock renewal failed after retries",
@@ -239,7 +251,8 @@ func GetStats() map[string]int64 {
 	return m
 }
 
-// Shutdown gracefully shuts down the lock manager
+// Shutdown gracefully shuts down the lock manager.
+// Waits for all managed locks to be released (or timeout).
 func Shutdown(ctx context.Context) error {
 	globalLockManager.stopRenewalService()
 
@@ -250,10 +263,15 @@ func Shutdown(ctx context.Context) error {
 	for {
 		select {
 		case <-timeout:
-			return fmt.Errorf("shutdown timeout, %d locks still active",
-				atomic.LoadInt64(&globalLockManager.stats.ActiveLocks))
+			globalLockManager.mutex.RLock()
+			n := len(globalLockManager.locks)
+			globalLockManager.mutex.RUnlock()
+			return fmt.Errorf("shutdown timeout, %d locks still active", n)
 		case <-ticker.C:
-			if atomic.LoadInt64(&globalLockManager.stats.ActiveLocks) == 0 {
+			globalLockManager.mutex.RLock()
+			n := len(globalLockManager.locks)
+			globalLockManager.mutex.RUnlock()
+			if n == 0 {
 				return nil
 			}
 		case <-ctx.Done():
