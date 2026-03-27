@@ -46,9 +46,8 @@ func NewEtcdLockPlugin() *PlugEtcdLock {
 
 // InitializeResources implements custom initialization logic
 func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
-	// Get etcd client from etcd config center plugin
-	// This assumes etcd config center plugin is loaded first
-	etcdPlugin, err := rt.GetResource("etcd.config.center")
+	// Get the started etcd plugin instance from the shared runtime.
+	etcdPlugin, err := rt.GetSharedResource("etcd.config.center")
 	if err != nil {
 		return fmt.Errorf("etcd config center plugin not found, please load it first: %w", err)
 	}
@@ -73,6 +72,18 @@ func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
 
 	log.Infof("Etcd lock plugin initialized successfully")
 	return nil
+}
+
+// GetDependencies ensures the lock plugin starts after the etcd config-center plugin.
+func (p *PlugEtcdLock) GetDependencies() []plugins.Dependency {
+	return []plugins.Dependency{
+		{
+			Name:        "etcd.config.center",
+			Type:        plugins.DependencyTypeRequired,
+			Required:    true,
+			Description: "Etcd config center plugin provides the live etcd client",
+		},
+	}
 }
 
 // StartupTasks implements custom startup logic
