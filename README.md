@@ -87,6 +87,10 @@ Create a reusable lock instance.
 func NewLockFromClient(ctx context.Context, key string, options LockOptions) (*EtcdLock, error)
 ```
 
+## Validation
+
+Current automated baseline in this workspace is `go test ./... -> [no test files]`. See [VALIDATION.md](./VALIDATION.md) for the exact output and the recommended manual smoke checks.
+
 ## Dependencies
 
 - `lynx-etcd` - etcd configuration center plugin (required)
