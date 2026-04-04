@@ -2,7 +2,6 @@ package etcdlock
 
 import (
 	"context"
-	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -21,10 +20,17 @@ func SetCallback(callback LockCallback) {
 	globalCallback = callback
 }
 
-// GetEtcdClient gets the etcd client from the plugin
+// GetEtcdClient gets the current etcd client through the registered provider.
 var GetEtcdClient = func() *clientv3.Client {
-	// This will be set by the plugin during initialization
-	return nil
+	provider := GetClientProvider()
+	if provider == nil {
+		return nil
+	}
+	client, err := provider.Client(context.Background())
+	if err != nil {
+		return nil
+	}
+	return client
 }
 
 // Lock acquires a distributed lock for the specified key and executes the callback function, automatically releasing the lock after execution.
@@ -42,14 +48,8 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 		return ErrLockFnRequired
 	}
 
-	// Get etcd client
-	client := GetEtcdClient()
-	if client == nil {
-		return fmt.Errorf("etcd client not found")
-	}
-
 	// Create lock instance
-	lock, err := NewLock(ctx, client, key, options)
+	lock, err := NewLockFromClient(ctx, key, options)
 	if err != nil {
 		return err
 	}
@@ -96,15 +96,14 @@ func LockWithRetry(ctx context.Context, key string, expiration time.Duration, fn
 	return LockWithOptions(ctx, key, options, fn)
 }
 
-// NewLockFromClient creates a reusable lock instance from an etcd client
+// NewLockFromClient creates a reusable lock instance from the current etcd client provider.
 func NewLockFromClient(ctx context.Context, key string, options LockOptions) (*EtcdLock, error) {
-	// Get etcd client
-	client := GetEtcdClient()
-	if client == nil {
-		return nil, fmt.Errorf("etcd client not found")
+	provider, err := resolveClientProvider()
+	if err != nil {
+		return nil, err
 	}
 
-	return NewLock(ctx, client, key, options)
+	return NewLock(ctx, provider, key, options)
 }
 
 // EnableAutoRenew registers the current lock to the global renewal manager.

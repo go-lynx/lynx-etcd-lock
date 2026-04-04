@@ -100,7 +100,7 @@ func (NoOpCallback) OnLockAcquireFailed(key string, error error)       {}
 
 // EtcdLock implements etcd-based distributed lock
 type EtcdLock struct {
-	client           *clientv3.Client
+	provider         ClientProvider
 	key              string
 	leaseID          clientv3.LeaseID
 	expiration       time.Duration

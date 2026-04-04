@@ -25,6 +25,7 @@ const (
 type PlugEtcdLock struct {
 	*plugins.BasePlugin
 	client      *clientv3.Client
+	rt          plugins.Runtime
 	initialized int32
 	destroyed   int32
 	mu          sync.RWMutex
@@ -66,9 +67,16 @@ func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
 		return fmt.Errorf("etcd plugin does not provide client")
 	}
 
-	// Set global client getter
-	GetEtcdClient = func() *clientv3.Client {
-		return p.client
+	p.rt = rt.WithPluginContext(pluginName)
+	GetClientProvider = func() ClientProvider {
+		return clientProviderFunc(func(ctx context.Context) (*clientv3.Client, error) {
+			p.mu.RLock()
+			defer p.mu.RUnlock()
+			if p.client == nil {
+				return nil, fmt.Errorf("etcd client is nil")
+			}
+			return p.client, nil
+		})
 	}
 
 	log.Infof("Etcd lock plugin initialized successfully")
@@ -103,6 +111,21 @@ func (p *PlugEtcdLock) StartupTasks() error {
 		return fmt.Errorf("etcd client is nil")
 	}
 
+	if p.rt != nil {
+		lockProvider := GetProvider()
+		for _, resourceName := range []string{pluginName, pluginName + ".provider"} {
+			if err := p.rt.RegisterSharedResource(resourceName, lockProvider); err != nil {
+				log.Warnf("failed to register etcd lock shared resource %s: %v", resourceName, err)
+			}
+		}
+		if err := p.rt.RegisterPrivateResource("provider", lockProvider); err != nil {
+			log.Warnf("failed to register etcd lock private provider resource: %v", err)
+		}
+		if err := p.rt.RegisterPrivateResource("client_provider", GetClientProvider()); err != nil {
+			log.Warnf("failed to register etcd lock private client provider resource: %v", err)
+		}
+	}
+
 	atomic.StoreInt32(&p.initialized, 1)
 	log.Infof("Etcd lock plugin started successfully")
 	return nil
@@ -125,6 +148,8 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 	}
 
 	p.client = nil
+	p.rt = nil
+	GetClientProvider = func() ClientProvider { return nil }
 	GetEtcdClient = func() *clientv3.Client { return nil }
 	atomic.StoreInt32(&p.initialized, 0)
 	atomic.StoreInt32(&p.destroyed, 1)

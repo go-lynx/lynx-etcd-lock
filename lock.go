@@ -28,6 +28,26 @@ func (el *EtcdLock) GetKey() string {
 	return el.key
 }
 
+func (el *EtcdLock) currentClient(ctx context.Context) (*clientv3.Client, error) {
+	if el == nil {
+		return nil, fmt.Errorf("etcd lock is nil")
+	}
+	if el.provider == nil {
+		return nil, fmt.Errorf("etcd client provider not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	client, err := el.provider.Client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		return nil, fmt.Errorf("etcd client is nil")
+	}
+	return client, nil
+}
+
 // GetExpiration gets the lock expiration time
 func (el *EtcdLock) GetExpiration() time.Duration {
 	return el.expiration
@@ -61,6 +81,11 @@ func (el *EtcdLock) IsExpired() bool {
 
 // Renew manually renews the lock by extending the existing lease via KeepAliveOnce.
 func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) (renewErr error) {
+	client, err := el.currentClient(ctx)
+	if err != nil {
+		globalCallback.OnLockRenewalFailed(el.key, err)
+		return err
+	}
 	start := time.Now()
 	defer func() {
 		observeOperationLatency("renew", operationStatus(renewErr), time.Since(start))
@@ -75,7 +100,7 @@ func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) (ren
 	}
 
 	// Extend the existing lease (key is bound to this lease)
-	resp, err := el.client.KeepAliveOnce(ctx, leaseID)
+	resp, err := client.KeepAliveOnce(ctx, leaseID)
 	if err != nil {
 		globalCallback.OnLockRenewalFailed(el.key, err)
 		return fmt.Errorf("failed to keep alive lease: %w", err)
@@ -96,6 +121,10 @@ func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) (ren
 
 // Release releases the lock
 func (el *EtcdLock) Release(ctx context.Context) (releaseErr error) {
+	client, err := el.currentClient(ctx)
+	if err != nil {
+		return err
+	}
 	start := time.Now()
 	defer func() {
 		observeOperationLatency("unlock", operationStatus(releaseErr), time.Since(start))
@@ -123,7 +152,7 @@ func (el *EtcdLock) Release(ctx context.Context) (releaseErr error) {
 	globalLockManager.removeLock(el.key)
 
 	// Revoke the lease to release the lock
-	_, err := el.client.Revoke(ctx, leaseID)
+	_, err = client.Revoke(ctx, leaseID)
 	if err != nil {
 		return fmt.Errorf("failed to revoke lease: %w", err)
 	}
@@ -139,6 +168,10 @@ func (el *EtcdLock) Release(ctx context.Context) (releaseErr error) {
 
 // IsLocked checks if the lock is held by the current instance
 func (el *EtcdLock) IsLocked(ctx context.Context) (bool, error) {
+	client, err := el.currentClient(ctx)
+	if err != nil {
+		return false, err
+	}
 	el.mutex.Lock()
 	leaseID := el.leaseID
 	el.mutex.Unlock()
@@ -148,7 +181,7 @@ func (el *EtcdLock) IsLocked(ctx context.Context) (bool, error) {
 	}
 
 	// Check if lease still exists
-	ttlResp, err := el.client.TimeToLive(ctx, leaseID)
+	ttlResp, err := client.TimeToLive(ctx, leaseID)
 	if err != nil {
 		return false, err
 	}
@@ -158,6 +191,11 @@ func (el *EtcdLock) IsLocked(ctx context.Context) (bool, error) {
 
 // Acquire attempts to acquire the lock
 func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
+	client, err := el.currentClient(ctx)
+	if err != nil {
+		globalCallback.OnLockAcquireFailed(el.key, err)
+		return err
+	}
 	start := time.Now()
 	defer func() {
 		observeOperationLatency("lock", operationStatus(acquireErr), time.Since(start))
@@ -166,14 +204,14 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 	lockKey := buildLockKey(el.key)
 
 	// Create lease
-	lease, err := el.client.Grant(ctx, int64(el.expiration.Seconds()))
+	lease, err := client.Grant(ctx, int64(el.expiration.Seconds()))
 	if err != nil {
 		globalCallback.OnLockAcquireFailed(el.key, err)
 		return fmt.Errorf("failed to grant lease: %w", err)
 	}
 
 	// Try to acquire lock with transaction
-	txn := el.client.Txn(ctx)
+	txn := client.Txn(ctx)
 	txn.If(clientv3.Compare(clientv3.CreateRevision(lockKey), "=", 0)).
 		Then(clientv3.OpPut(lockKey, "", clientv3.WithLease(lease.ID))).
 		Else(clientv3.OpGet(lockKey))
@@ -181,7 +219,7 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 	txnResp, err := txn.Commit()
 	if err != nil {
 		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		el.client.Revoke(revokeCtx, lease.ID)
+		client.Revoke(revokeCtx, lease.ID)
 		revokeCancel()
 		globalCallback.OnLockAcquireFailed(el.key, err)
 		return fmt.Errorf("failed to commit transaction: %w", err)
@@ -189,7 +227,7 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 
 	if !txnResp.Succeeded {
 		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		el.client.Revoke(revokeCtx, lease.ID)
+		client.Revoke(revokeCtx, lease.ID)
 		revokeCancel()
 		globalCallback.OnLockAcquireFailed(el.key, ErrLockAcquireConflict)
 		return ErrLockAcquireConflict
@@ -248,32 +286,45 @@ func (el *EtcdLock) AcquireWithRetry(ctx context.Context, strategy RetryStrategy
 
 // keepAlive keeps the lease alive
 func (el *EtcdLock) keepAlive() {
-	ch, kaErr := el.client.KeepAlive(el.ctx, el.leaseID)
-	if kaErr != nil {
-		log.ErrorCtx(el.ctx, "failed to start keep alive", "error", kaErr)
-		return
-	}
-
 	for {
-		select {
-		case <-el.ctx.Done():
+		if el.ctx == nil {
 			return
-		case ka, ok := <-ch:
-			if !ok {
-				log.WarnCtx(el.ctx, "keep alive channel closed", "key", el.key)
+		}
+
+		client, err := el.currentClient(el.ctx)
+		if err != nil {
+			log.ErrorCtx(el.ctx, "failed to resolve etcd client for keep alive", "error", err)
+			return
+		}
+		ch, kaErr := client.KeepAlive(el.ctx, el.leaseID)
+		if kaErr != nil {
+			log.ErrorCtx(el.ctx, "failed to start keep alive", "error", kaErr)
+			return
+		}
+
+		for {
+			select {
+			case <-el.ctx.Done():
 				return
-			}
-			if ka != nil {
-				el.mutex.Lock()
-				el.expiresAt = time.Now().Add(time.Duration(ka.TTL) * time.Second)
-				el.mutex.Unlock()
+			case ka, ok := <-ch:
+				if !ok {
+					log.WarnCtx(el.ctx, "keep alive channel closed", "key", el.key)
+					time.Sleep(50 * time.Millisecond)
+					goto retryKeepAlive
+				}
+				if ka != nil {
+					el.mutex.Lock()
+					el.expiresAt = time.Now().Add(time.Duration(ka.TTL) * time.Second)
+					el.mutex.Unlock()
+				}
 			}
 		}
+	retryKeepAlive:
 	}
 }
 
 // NewLock creates a reusable lock instance
-func NewLock(ctx context.Context, client *clientv3.Client, key string, options LockOptions) (*EtcdLock, error) {
+func NewLock(ctx context.Context, provider ClientProvider, key string, options LockOptions) (*EtcdLock, error) {
 	// Validate lock key name
 	if err := ValidateKey(key); err != nil {
 		return nil, fmt.Errorf("invalid lock key: %w", err)
@@ -282,10 +333,16 @@ func NewLock(ctx context.Context, client *clientv3.Client, key string, options L
 	if err := options.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid lock options: %w", err)
 	}
+	if provider == nil {
+		return nil, fmt.Errorf("etcd client provider not found")
+	}
+	if _, err := provider.Client(ctx); err != nil {
+		return nil, fmt.Errorf("failed to resolve etcd client: %w", err)
+	}
 
 	// Create lock instance
 	lock := &EtcdLock{
-		client:           client,
+		provider:         provider,
 		key:              key,
 		expiration:       options.Expiration,
 		renewalThreshold: options.RenewalThreshold,

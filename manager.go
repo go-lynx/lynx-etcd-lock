@@ -201,6 +201,11 @@ func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
 
 // renewLock renew a single lock
 func (lm *lockManager) renewLock(ctx context.Context, lock *EtcdLock) error {
+	client, err := lock.currentClient(ctx)
+	if err != nil {
+		return err
+	}
+
 	lock.mutex.Lock()
 	expiresAtSnap := lock.expiresAt
 	expirationSnap := lock.expiration
@@ -217,7 +222,7 @@ func (lm *lockManager) renewLock(ctx context.Context, lock *EtcdLock) error {
 	}
 
 	start := time.Now()
-	_, err := lock.client.KeepAliveOnce(ctx, leaseID)
+	_, err = client.KeepAliveOnce(ctx, leaseID)
 	latency := time.Since(start)
 	atomic.AddInt64(&lm.stats.RenewLatencyNs, latency.Nanoseconds())
 	atomic.AddInt64(&lm.stats.RenewLatencyCount, 1)
