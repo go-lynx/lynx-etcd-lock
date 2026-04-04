@@ -78,11 +78,9 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 		}
 		rctx, cancel := context.WithTimeout(context.Background(), to)
 		defer cancel()
-		start := time.Now()
 		if releaseErr := lock.Release(rctx); releaseErr != nil {
 			log.ErrorCtx(ctx, "failed to release etcd lock", "error", releaseErr)
 		}
-		observeOperationLatency("unlock", time.Since(start))
 	}()
 
 	// Execute user function
@@ -129,9 +127,4 @@ func (el *EtcdLock) EnableAutoRenew(options LockOptions) {
 	}
 	globalLockManager.mutex.Unlock()
 	globalLockManager.startRenewalService(options)
-}
-
-// observeOperationLatency observes operation latency (placeholder for metrics)
-func observeOperationLatency(operation string, duration time.Duration) {
-	// This can be extended to record metrics
 }

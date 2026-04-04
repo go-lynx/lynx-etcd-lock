@@ -221,6 +221,7 @@ func (lm *lockManager) renewLock(ctx context.Context, lock *EtcdLock) error {
 	latency := time.Since(start)
 	atomic.AddInt64(&lm.stats.RenewLatencyNs, latency.Nanoseconds())
 	atomic.AddInt64(&lm.stats.RenewLatencyCount, 1)
+	observeOperationLatency("renew", operationStatus(err), latency)
 
 	if err != nil {
 		return fmt.Errorf("keep alive failed: %w", err)

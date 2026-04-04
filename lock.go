@@ -60,7 +60,12 @@ func (el *EtcdLock) IsExpired() bool {
 }
 
 // Renew manually renews the lock by extending the existing lease via KeepAliveOnce.
-func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) error {
+func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) (renewErr error) {
+	start := time.Now()
+	defer func() {
+		observeOperationLatency("renew", operationStatus(renewErr), time.Since(start))
+	}()
+
 	el.mutex.Lock()
 	leaseID := el.leaseID
 	el.mutex.Unlock()
@@ -90,7 +95,12 @@ func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) erro
 }
 
 // Release releases the lock
-func (el *EtcdLock) Release(ctx context.Context) error {
+func (el *EtcdLock) Release(ctx context.Context) (releaseErr error) {
+	start := time.Now()
+	defer func() {
+		observeOperationLatency("unlock", operationStatus(releaseErr), time.Since(start))
+	}()
+
 	el.mutex.Lock()
 	leaseID := el.leaseID
 	cancel := el.cancel
@@ -147,7 +157,12 @@ func (el *EtcdLock) IsLocked(ctx context.Context) (bool, error) {
 }
 
 // Acquire attempts to acquire the lock
-func (el *EtcdLock) Acquire(ctx context.Context) error {
+func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
+	start := time.Now()
+	defer func() {
+		observeOperationLatency("lock", operationStatus(acquireErr), time.Since(start))
+	}()
+
 	lockKey := buildLockKey(el.key)
 
 	// Create lease

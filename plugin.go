@@ -32,6 +32,7 @@ type PlugEtcdLock struct {
 
 // NewEtcdLockPlugin creates a new etcd distributed lock plugin
 func NewEtcdLockPlugin() *PlugEtcdLock {
+	ensureMetricsRegistered()
 	return &PlugEtcdLock{
 		BasePlugin: plugins.NewBasePlugin(
 			plugins.GeneratePluginID("", pluginName, pluginVersion),
@@ -91,8 +92,11 @@ func (p *PlugEtcdLock) StartupTasks() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if atomic.LoadInt32(&p.destroyed) == 1 {
+		return fmt.Errorf("etcd lock plugin already destroyed")
+	}
 	if atomic.LoadInt32(&p.initialized) == 1 {
-		return fmt.Errorf("etcd lock plugin already initialized")
+		return nil
 	}
 
 	if p.client == nil {
@@ -110,7 +114,7 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 	defer p.mu.Unlock()
 
 	if atomic.LoadInt32(&p.destroyed) == 1 {
-		return fmt.Errorf("etcd lock plugin already destroyed")
+		return nil
 	}
 
 	// Shutdown lock manager
@@ -120,6 +124,9 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 		log.Warnf("Failed to shutdown lock manager: %v", err)
 	}
 
+	p.client = nil
+	GetEtcdClient = func() *clientv3.Client { return nil }
+	atomic.StoreInt32(&p.initialized, 0)
 	atomic.StoreInt32(&p.destroyed, 1)
 	log.Infof("Etcd lock plugin cleanup completed")
 	return nil
