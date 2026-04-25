@@ -3,12 +3,12 @@ package etcdlock
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-lynx/lynx/log"
+	"github.com/go-lynx/lynx/pkg/timex"
 )
 
 // Global lock manager
@@ -37,20 +37,6 @@ type lockManager struct {
 		RenewLatencyCount int64
 		WorkerPoolCap     int
 	}
-}
-
-// rng provides package-local randomness
-var (
-	rng   = rand.New(rand.NewSource(time.Now().UnixNano()))
-	rngMu sync.Mutex
-)
-
-// randFloat64 returns a random float64 in [0.0, 1.0)
-func randFloat64() float64 {
-	rngMu.Lock()
-	v := rng.Float64()
-	rngMu.Unlock()
-	return v
 }
 
 // startRenewalService starts the renewal service
@@ -174,16 +160,7 @@ func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
 		atomic.AddInt64(&lm.stats.RenewalErrors, 1)
 
 		if i < maxRetries-1 {
-			delay := config.BaseDelay * time.Duration(1<<i)
-			if delay > 0 {
-				jitter := time.Duration(float64(delay) * (0.5 + randFloat64()))
-				if jitter > 0 {
-					delay = jitter
-				}
-			}
-			if delay > config.MaxDelay {
-				delay = config.MaxDelay
-			}
+			delay := timex.ExponentialBackoff(config.BaseDelay, config.MaxDelay, i, 0.5)
 			time.Sleep(delay)
 		}
 	}
