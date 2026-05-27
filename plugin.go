@@ -68,7 +68,7 @@ func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
 	}
 
 	p.rt = rt.WithPluginContext(pluginName)
-	GetClientProvider = func() ClientProvider {
+	setClientProvider(func() ClientProvider {
 		return clientProviderFunc(func(ctx context.Context) (*clientv3.Client, error) {
 			p.mu.RLock()
 			defer p.mu.RUnlock()
@@ -77,7 +77,7 @@ func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
 			}
 			return p.client, nil
 		})
-	}
+	})
 
 	log.Infof("Etcd lock plugin initialized successfully")
 	return nil
@@ -149,7 +149,7 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 
 	p.client = nil
 	p.rt = nil
-	GetClientProvider = func() ClientProvider { return nil }
+	resetClientProvider()
 	GetEtcdClient = func() *clientv3.Client { return nil }
 	atomic.StoreInt32(&p.initialized, 0)
 	atomic.StoreInt32(&p.destroyed, 1)
@@ -162,6 +162,8 @@ func (p *PlugEtcdLock) CheckHealth() error {
 	if atomic.LoadInt32(&p.initialized) == 0 {
 		return fmt.Errorf("etcd lock plugin not initialized")
 	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.client == nil {
 		return fmt.Errorf("etcd client is nil")
 	}

@@ -26,6 +26,9 @@ func (lo *LockOptions) Validate() error {
 	if lo.Expiration <= 0 {
 		return fmt.Errorf("expiration must be positive, got %v", lo.Expiration)
 	}
+	if lo.Expiration < time.Second {
+		return fmt.Errorf("expiration must be at least 1s for etcd leases, got %v", lo.Expiration)
+	}
 
 	if lo.RenewalThreshold < 0 || lo.RenewalThreshold > 1 {
 		return fmt.Errorf("renewal threshold must be between 0 and 1, got %f", lo.RenewalThreshold)
@@ -107,6 +110,7 @@ type EtcdLock struct {
 	expiresAt        time.Time
 	mutex            sync.Mutex
 	renewalThreshold float64
+	renewalEnabled   bool
 	acquiredAt       time.Time
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -146,4 +150,38 @@ func init() {
 // buildLockKey generates actual etcd key based on business key
 func buildLockKey(base string) string {
 	return fmt.Sprintf("lynx/lock/%s", base)
+}
+
+func normalizeLockOptions(options LockOptions) LockOptions {
+	if options.Expiration <= 0 {
+		options.Expiration = DefaultLockOptions.Expiration
+	}
+	if options.RetryStrategy.MaxRetries == 0 && options.RetryStrategy.RetryDelay == 0 {
+		options.RetryStrategy = DefaultRetryStrategy
+	}
+	if options.RenewalThreshold == 0 {
+		options.RenewalThreshold = DefaultLockOptions.RenewalThreshold
+	}
+	if options.WorkerPoolSize == 0 {
+		options.WorkerPoolSize = DefaultLockOptions.WorkerPoolSize
+	}
+	if options.RenewalConfig.MaxRetries == 0 {
+		options.RenewalConfig.MaxRetries = DefaultRenewalConfig.MaxRetries
+	}
+	if options.RenewalConfig.BaseDelay == 0 {
+		options.RenewalConfig.BaseDelay = DefaultRenewalConfig.BaseDelay
+	}
+	if options.RenewalConfig.MaxDelay == 0 {
+		options.RenewalConfig.MaxDelay = DefaultRenewalConfig.MaxDelay
+	}
+	if options.RenewalConfig.CheckInterval == 0 {
+		options.RenewalConfig.CheckInterval = DefaultRenewalConfig.CheckInterval
+	}
+	if options.RenewalConfig.OperationTimeout == 0 {
+		options.RenewalConfig.OperationTimeout = DefaultRenewalConfig.OperationTimeout
+	}
+	if options.OperationTimeout == 0 {
+		options.OperationTimeout = DefaultLockOptions.OperationTimeout
+	}
+	return options
 }

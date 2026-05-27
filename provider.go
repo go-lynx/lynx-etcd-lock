@@ -3,6 +3,7 @@ package etcdlock
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -29,8 +30,32 @@ type Provider interface {
 
 type provider struct{}
 
+var (
+	clientProviderMu sync.RWMutex
+	clientProviderFn = func() ClientProvider {
+		return nil
+	}
+)
+
 var GetClientProvider = func() ClientProvider {
-	return nil
+	clientProviderMu.RLock()
+	defer clientProviderMu.RUnlock()
+	return clientProviderFn()
+}
+
+func setClientProvider(fn func() ClientProvider) {
+	if fn == nil {
+		fn = func() ClientProvider { return nil }
+	}
+	clientProviderMu.Lock()
+	clientProviderFn = fn
+	clientProviderMu.Unlock()
+}
+
+func resetClientProvider() {
+	setClientProvider(func() ClientProvider {
+		return nil
+	})
 }
 
 // GetProvider returns the injectable etcd lock facade.

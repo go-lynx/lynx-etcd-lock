@@ -41,6 +41,7 @@ type lockManager struct {
 
 // startRenewalService starts the renewal service
 func (lm *lockManager) startRenewalService(options LockOptions) {
+	options = normalizeLockOptions(options)
 	lm.mutex.Lock()
 	if lm.running {
 		lm.mutex.Unlock()
@@ -75,12 +76,43 @@ func (lm *lockManager) startRenewalService(options LockOptions) {
 	}()
 }
 
-// removeLock removes a lock from the manager and updates stats
-func (lm *lockManager) removeLock(key string) {
+func (lm *lockManager) addManagedLock(lock *EtcdLock) {
+	if lock == nil {
+		return
+	}
 	lm.mutex.Lock()
-	if _, exists := lm.locks[key]; exists {
-		delete(lm.locks, key)
-		atomic.AddInt64(&lm.stats.ActiveLocks, -1)
+	existing, exists := lm.locks[lock.key]
+	lm.locks[lock.key] = lock
+	if !exists {
+		atomic.AddInt64(&lm.stats.ActiveLocks, 1)
+		atomic.AddInt64(&lm.stats.TotalLocks, 1)
+	} else if existing != lock {
+		atomic.AddInt64(&lm.stats.TotalLocks, 1)
+	}
+	lm.mutex.Unlock()
+}
+
+func (lm *lockManager) decrementActiveLocks() {
+	for {
+		current := atomic.LoadInt64(&lm.stats.ActiveLocks)
+		if current <= 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&lm.stats.ActiveLocks, current, current-1) {
+			return
+		}
+	}
+}
+
+// removeLock removes a lock from the manager and updates stats if the identity matches.
+func (lm *lockManager) removeLock(lock *EtcdLock) {
+	if lock == nil {
+		return
+	}
+	lm.mutex.Lock()
+	if existing, exists := lm.locks[lock.key]; exists && existing == lock {
+		delete(lm.locks, lock.key)
+		lm.decrementActiveLocks()
 	}
 	lm.mutex.Unlock()
 }
@@ -100,6 +132,7 @@ func (lm *lockManager) stopRenewalService() {
 
 // processRenewals processes lock renewals
 func (lm *lockManager) processRenewals(options LockOptions) {
+	options = normalizeLockOptions(options)
 	lm.mutex.RLock()
 
 	locksToRenew := make([]*EtcdLock, 0, len(lm.locks))
@@ -135,6 +168,7 @@ func (lm *lockManager) processRenewals(options LockOptions) {
 
 // renewLockWithRetry lock renewal with retry
 func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
+	options = normalizeLockOptions(options)
 	config := options.RenewalConfig
 	maxRetries := config.MaxRetries
 	if maxRetries <= 0 {
@@ -161,16 +195,13 @@ func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
 
 		if i < maxRetries-1 {
 			delay := timex.ExponentialBackoff(config.BaseDelay, config.MaxDelay, i, 0.5)
-			time.Sleep(delay)
+			if !waitForRetryDelay(lm.renewCtx, delay) {
+				return
+			}
 		}
 	}
 
-	lm.mutex.Lock()
-	if _, exists := lm.locks[lock.key]; exists {
-		delete(lm.locks, lock.key)
-		atomic.AddInt64(&lm.stats.ActiveLocks, -1)
-	}
-	lm.mutex.Unlock()
+	lm.removeLock(lock)
 
 	log.ErrorCtx(context.Background(), "lock renewal failed after retries",
 		"key", lock.key, "retries", maxRetries)
@@ -199,7 +230,7 @@ func (lm *lockManager) renewLock(ctx context.Context, lock *EtcdLock) error {
 	}
 
 	start := time.Now()
-	_, err = client.KeepAliveOnce(ctx, leaseID)
+	resp, err := client.KeepAliveOnce(ctx, leaseID)
 	latency := time.Since(start)
 	atomic.AddInt64(&lm.stats.RenewLatencyNs, latency.Nanoseconds())
 	atomic.AddInt64(&lm.stats.RenewLatencyCount, 1)
@@ -210,10 +241,28 @@ func (lm *lockManager) renewLock(ctx context.Context, lock *EtcdLock) error {
 	}
 
 	lock.mutex.Lock()
-	lock.expiresAt = time.Now().Add(lock.expiration)
+	if resp != nil && resp.TTL > 0 {
+		lock.expiresAt = time.Now().Add(time.Duration(resp.TTL) * time.Second)
+	} else {
+		lock.expiresAt = time.Now().Add(lock.expiration)
+	}
 	lock.mutex.Unlock()
 
 	return nil
+}
+
+func waitForRetryDelay(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // GetStats gets lock manager statistics
