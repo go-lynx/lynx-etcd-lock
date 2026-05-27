@@ -16,7 +16,7 @@ import (
 // Plugin metadata
 const (
 	pluginName        = "etcd.distributed.lock"
-	pluginVersion     = "v1.6.0-beta"
+	pluginVersion     = "v1.6.1"
 	pluginDescription = "etcd distributed lock plugin for lynx framework"
 	confPrefix        = "lynx.etcd-lock"
 )
