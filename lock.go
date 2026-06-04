@@ -70,7 +70,7 @@ func revokeLease(client *clientv3.Client, leaseID clientv3.LeaseID, key string) 
 	return lastErr
 }
 
-// GetKey gets the lock key name
+// GetKey returns the resource key this lock guards.
 func (el *EtcdLock) GetKey() string {
 	return el.key
 }
@@ -247,7 +247,7 @@ func (el *EtcdLock) IsLocked(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	// Check if lease still exists
+	// A positive remaining TTL means the lease (and thus the lock) is still live.
 	ttlResp, err := client.TimeToLive(ctx, leaseID)
 	if err != nil {
 		return false, err
@@ -289,7 +289,8 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 		return fmt.Errorf("failed to grant lease: %w", err)
 	}
 
-	// Try to acquire lock with transaction
+	// Atomically claim the key only if it does not yet exist (CreateRevision==0).
+	// On contention the Else branch fetches the current holder for diagnostics.
 	txn := client.Txn(ctx)
 	txn.If(clientv3.Compare(clientv3.CreateRevision(lockKey), "=", 0)).
 		Then(clientv3.OpPut(lockKey, "", clientv3.WithLease(lease.ID))).
@@ -308,7 +309,6 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 		return ErrLockAcquireConflict
 	}
 
-	// Lock acquired successfully
 	now := time.Now()
 	el.mutex.Lock()
 	el.leaseID = lease.ID
@@ -318,7 +318,6 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 	renewalThreshold := el.renewalThreshold
 	el.mutex.Unlock()
 
-	// Start keep-alive if renewal is enabled
 	if renewalEnabled && renewalThreshold > 0 {
 		el.mutex.Lock()
 		el.ctx, el.cancel = context.WithCancel(context.Background())
@@ -338,7 +337,6 @@ func (el *EtcdLock) AcquireWithRetry(ctx context.Context, strategy RetryStrategy
 			return ErrMaxRetriesExceeded
 		}
 		if retries > 0 {
-			// Add jitter to avoid hot spot collisions
 			delay := strategy.RetryDelay
 			if delay > 0 {
 				if !waitForRetryDelay(ctx, delay) {
@@ -353,7 +351,7 @@ func (el *EtcdLock) AcquireWithRetry(ctx context.Context, strategy RetryStrategy
 		if err != ErrLockAcquireConflict {
 			return err
 		}
-		// Continue retrying according to strategy on conflict
+		// Only contention is retryable; with no retry budget, report the conflict.
 		if strategy.MaxRetries == 0 {
 			return ErrLockAcquireConflict
 		}
@@ -464,14 +462,13 @@ func nextBackoff(current, max time.Duration) time.Duration {
 	return next
 }
 
-// NewLock creates a reusable lock instance
+// NewLock builds a reusable lock for key, validating the key and options and
+// verifying the provider can resolve a client. It does not acquire the lock.
 func NewLock(ctx context.Context, provider ClientProvider, key string, options LockOptions) (*EtcdLock, error) {
-	// Validate lock key name
 	if err := ValidateKey(key); err != nil {
 		return nil, fmt.Errorf("invalid lock key: %w", err)
 	}
 	options = normalizeLockOptions(options)
-	// Validate configuration options
 	if err := options.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid lock options: %w", err)
 	}
@@ -482,7 +479,6 @@ func NewLock(ctx context.Context, provider ClientProvider, key string, options L
 		return nil, fmt.Errorf("failed to resolve etcd client: %w", err)
 	}
 
-	// Create lock instance
 	lock := &EtcdLock{
 		provider:         provider,
 		key:              key,

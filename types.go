@@ -212,7 +212,6 @@ var (
 	DefaultLockOptions LockOptions
 )
 
-// init initializes default configurations
 func init() {
 	DefaultLockOptions = LockOptions{
 		Expiration:       30 * time.Second,

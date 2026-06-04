@@ -16,7 +16,7 @@ var (
 	globalCallback   LockCallback = NoOpCallback{}
 )
 
-// SetCallback sets the global callback
+// SetCallback installs the process-wide lock-event callback; nil resets to no-op.
 func SetCallback(callback LockCallback) {
 	if callback == nil {
 		callback = NoOpCallback{}
@@ -49,29 +49,28 @@ var GetEtcdClient = func() *clientv3.Client {
 	return client
 }
 
-// Lock acquires a distributed lock for the specified key and executes the callback function, automatically releasing the lock after execution.
+// Lock acquires the lock for key with the default options (only the expiration
+// overridden), runs fn in the critical section, and releases the lock afterwards.
 func Lock(ctx context.Context, key string, expiration time.Duration, fn func() error) error {
-	// Use DefaultLockOptions as base configuration, only overriding Expiration
 	options := DefaultLockOptions
 	options.Expiration = expiration
 	return LockWithOptions(ctx, key, options, fn)
 }
 
-// LockWithOptions uses complete configuration options to acquire lock and execute callback function.
+// LockWithOptions acquires the lock with the given options, runs fn while holding
+// it, and always releases on return. If the lock is lost mid-section (see the
+// fn-vs-Done race below) fn is abandoned and an ErrLockLost-wrapped error returns.
 func LockWithOptions(ctx context.Context, key string, options LockOptions, fn func() error) (retErr error) {
-	// Validate callback function
 	if fn == nil {
 		return ErrLockFnRequired
 	}
 	options = normalizeLockOptions(options)
 
-	// Create lock instance
 	lock, err := NewLockFromClient(ctx, key, options)
 	if err != nil {
 		return err
 	}
 
-	// Try to acquire lock
 	if options.RetryStrategy.MaxRetries > 0 {
 		err = lock.AcquireWithRetry(ctx, options.RetryStrategy)
 	} else {
@@ -82,12 +81,12 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 		return err
 	}
 
-	// If renewal is enabled, include in global management
 	if options.RenewalEnabled {
 		lock.EnableAutoRenew(options)
 	}
 
-	// Ensure final release - use Background to avoid caller ctx cancellation blocking release
+	// Release on a Background-derived context so a cancelled caller ctx cannot
+	// block the release.
 	defer func() {
 		to := options.OperationTimeout
 		if to <= 0 {
@@ -136,9 +135,8 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 	}
 }
 
-// LockWithRetry acquires lock and executes function, supports retry by strategy.
+// LockWithRetry is Lock with a caller-supplied retry strategy for contention.
 func LockWithRetry(ctx context.Context, key string, expiration time.Duration, fn func() error, strategy RetryStrategy) error {
-	// Use DefaultLockOptions as base configuration, override Expiration and RetryStrategy
 	options := DefaultLockOptions
 	options.Expiration = expiration
 	options.RetryStrategy = strategy

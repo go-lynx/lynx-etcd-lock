@@ -13,7 +13,6 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// Plugin metadata
 const (
 	pluginName        = "etcd.distributed.lock"
 	pluginVersion     = "v1.6.1"
@@ -21,7 +20,8 @@ const (
 	confPrefix        = "lynx.etcd-lock"
 )
 
-// PlugEtcdLock represents an etcd distributed lock plugin instance
+// PlugEtcdLock is the distributed-lock plugin. It borrows the live etcd client
+// from the config-centre plugin rather than dialing its own connection.
 type PlugEtcdLock struct {
 	*plugins.BasePlugin
 	client      *clientv3.Client
@@ -31,7 +31,8 @@ type PlugEtcdLock struct {
 	mu          sync.RWMutex
 }
 
-// NewEtcdLockPlugin creates a new etcd distributed lock plugin
+// NewEtcdLockPlugin returns an uninitialized lock plugin. Its weight is one below
+// the config centre so the centre (which owns the etcd client) starts first.
 func NewEtcdLockPlugin() *PlugEtcdLock {
 	ensureMetricsRegistered()
 	return &PlugEtcdLock{
@@ -41,14 +42,14 @@ func NewEtcdLockPlugin() *PlugEtcdLock {
 			pluginDescription,
 			pluginVersion,
 			confPrefix,
-			math.MaxInt-1, // Lower priority than config center
+			math.MaxInt-1,
 		),
 	}
 }
 
-// InitializeResources implements custom initialization logic
+// InitializeResources fetches the shared etcd client from the config-centre
+// plugin and installs the client provider used to build locks.
 func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
-	// Get the started etcd plugin instance from the shared runtime.
 	etcdPlugin, err := rt.GetSharedResource("etcd.config.center")
 	if err != nil {
 		return fmt.Errorf("etcd config center plugin not found, please load it first: %w", err)
@@ -57,7 +58,6 @@ func (p *PlugEtcdLock) InitializeResources(rt plugins.Runtime) error {
 		return fmt.Errorf("etcd config center plugin resource is nil")
 	}
 
-	// Try to get client from etcd plugin
 	if plugEtcd, ok := etcdPlugin.(interface{ GetClient() *clientv3.Client }); ok {
 		p.client = plugEtcd.GetClient()
 		if p.client == nil {
@@ -95,7 +95,8 @@ func (p *PlugEtcdLock) GetDependencies() []plugins.Dependency {
 	}
 }
 
-// StartupTasks implements custom startup logic
+// StartupTasks publishes the lock provider as a runtime resource so other
+// plugins can acquire locks. Idempotent and safe once the client is present.
 func (p *PlugEtcdLock) StartupTasks() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -131,7 +132,8 @@ func (p *PlugEtcdLock) StartupTasks() error {
 	return nil
 }
 
-// CleanupTasks implements custom cleanup logic
+// CleanupTasks drains the renewal manager (waiting up to 10s for in-flight locks
+// to release), clears the borrowed client, and tears down the provider.
 func (p *PlugEtcdLock) CleanupTasks() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -140,7 +142,6 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 		return nil
 	}
 
-	// Shutdown lock manager
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := Shutdown(ctx); err != nil {
@@ -157,7 +158,7 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 	return nil
 }
 
-// CheckHealth implements health check
+// CheckHealth reports healthy only when initialized and the etcd client is present.
 func (p *PlugEtcdLock) CheckHealth() error {
 	if atomic.LoadInt32(&p.initialized) == 0 {
 		return fmt.Errorf("etcd lock plugin not initialized")

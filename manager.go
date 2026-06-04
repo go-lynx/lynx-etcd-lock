@@ -11,22 +11,22 @@ import (
 	"github.com/go-lynx/lynx/pkg/timex"
 )
 
-// Global lock manager
 var globalLockManager = &lockManager{
 	locks: make(map[string]*EtcdLock),
 }
 
-// lockManager manages all distributed lock instances
+// lockManager renews every auto-renew lock from a single background ticker,
+// dispatching renewals through a bounded worker pool.
 type lockManager struct {
 	mutex sync.RWMutex
 	locks map[string]*EtcdLock
-	// Renewal service
+
 	renewCtx    context.Context
 	renewCancel context.CancelFunc
 	running     bool
-	// Worker pool
+
 	workerPool chan struct{}
-	// Statistics
+
 	stats struct {
 		TotalLocks        int64
 		ActiveLocks       int64
@@ -39,7 +39,8 @@ type lockManager struct {
 	}
 }
 
-// startRenewalService starts the renewal service
+// startRenewalService starts the renewal ticker once; repeat calls are no-ops
+// while it is running.
 func (lm *lockManager) startRenewalService(options LockOptions) {
 	options = normalizeLockOptions(options)
 	lm.mutex.Lock()
@@ -49,7 +50,6 @@ func (lm *lockManager) startRenewalService(options LockOptions) {
 	}
 	lm.renewCtx, lm.renewCancel = context.WithCancel(context.Background())
 	lm.running = true
-	// Initialize worker pool
 	workerPoolSize := options.WorkerPoolSize
 	if workerPoolSize <= 0 {
 		workerPoolSize = DefaultLockOptions.WorkerPoolSize
@@ -117,7 +117,6 @@ func (lm *lockManager) removeLock(lock *EtcdLock) {
 	lm.mutex.Unlock()
 }
 
-// stopRenewalService stops the renewal service
 func (lm *lockManager) stopRenewalService() {
 	lm.mutex.Lock()
 	defer lm.mutex.Unlock()
@@ -130,7 +129,8 @@ func (lm *lockManager) stopRenewalService() {
 	lm.running = false
 }
 
-// processRenewals processes lock renewals
+// processRenewals renews every lock whose remaining TTL has dropped below its
+// renewal threshold, fanning the work out across the worker pool.
 func (lm *lockManager) processRenewals(options LockOptions) {
 	options = normalizeLockOptions(options)
 	lm.mutex.RLock()
@@ -176,7 +176,8 @@ func (lm *lockManager) processRenewals(options LockOptions) {
 	}
 }
 
-// renewLockWithRetry lock renewal with retry
+// renewLockWithRetry renews a lock, retrying with exponential backoff; on
+// terminal failure it marks the lock permanently lost.
 func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
 	options = normalizeLockOptions(options)
 	config := options.RenewalConfig
@@ -221,7 +222,8 @@ func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
 		"key", lock.key, "retries", maxRetries)
 }
 
-// renewLock renew a single lock
+// renewLock performs one KeepAliveOnce for a single lock, skipping the call if
+// the lock is still comfortably above its renewal threshold.
 func (lm *lockManager) renewLock(ctx context.Context, lock *EtcdLock) error {
 	client, err := lock.currentClient(ctx)
 	if err != nil {
@@ -279,7 +281,7 @@ func waitForRetryDelay(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-// GetStats gets lock manager statistics
+// GetStats returns a snapshot of the lock manager's counters and worker-queue depth.
 func GetStats() map[string]int64 {
 	m := map[string]int64{
 		"total_locks":         atomic.LoadInt64(&globalLockManager.stats.TotalLocks),
