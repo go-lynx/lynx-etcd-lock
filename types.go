@@ -92,6 +92,18 @@ type LockCallback interface {
 	OnLockAcquireFailed(key string, error error)
 }
 
+// LockLostCallback is an OPTIONAL interface a LockCallback may also implement to
+// be notified when the lock is permanently lost (e.g. the lease expired because
+// etcd was unreachable and renewal failed terminally). The caller can no longer
+// assume it holds the lock once this fires. It is kept separate from
+// LockCallback so adding loss notification does not break existing external
+// implementations of LockCallback. At the loss call site the registered callback
+// is type-asserted to LockLostCallback and OnLockLost is only invoked when it is
+// implemented.
+type LockLostCallback interface {
+	OnLockLost(key string, error error)
+}
+
 // NoOpCallback empty implementation callback
 type NoOpCallback struct{}
 
@@ -100,6 +112,9 @@ func (NoOpCallback) OnLockReleased(key string, duration time.Duration) {}
 func (NoOpCallback) OnLockRenewed(key string, duration time.Duration)  {}
 func (NoOpCallback) OnLockRenewalFailed(key string, error error)       {}
 func (NoOpCallback) OnLockAcquireFailed(key string, error error)       {}
+
+// OnLockLost lets NoOpCallback satisfy the optional LockLostCallback interface.
+func (NoOpCallback) OnLockLost(key string, error error) {}
 
 // EtcdLock implements etcd-based distributed lock
 type EtcdLock struct {
@@ -114,6 +129,69 @@ type EtcdLock struct {
 	acquiredAt       time.Time
 	ctx              context.Context
 	cancel           context.CancelFunc
+	// lost is closed exactly once when the lock is permanently lost (lease
+	// expired / renewal failed terminally). Callers can observe it via Done().
+	lost     chan struct{}
+	lostOnce sync.Once
+	lostErr  error
+}
+
+// ensureLostChan lazily allocates the lost channel. Caller must hold el.mutex.
+func (el *EtcdLock) ensureLostChan() chan struct{} {
+	if el.lost == nil {
+		el.lost = make(chan struct{})
+	}
+	return el.lost
+}
+
+// Done returns a channel that is closed when the lock is permanently lost.
+// It behaves like concurrency.Session.Done(): once closed, the caller must
+// assume it no longer holds the lock and abort its critical section.
+func (el *EtcdLock) Done() <-chan struct{} {
+	el.mutex.Lock()
+	defer el.mutex.Unlock()
+	return el.ensureLostChan()
+}
+
+// LostErr returns the error that caused the lock to be lost, or nil if the
+// lock has not been lost.
+func (el *EtcdLock) LostErr() error {
+	el.mutex.Lock()
+	defer el.mutex.Unlock()
+	return el.lostErr
+}
+
+// markLost transitions the lock into a permanently-lost state: it cancels any
+// keepAlive/holder goroutine, closes the lost channel (exactly once), forces
+// the lock into a not-held state and notifies the loss callback. Safe to call
+// multiple times and from multiple goroutines.
+func (el *EtcdLock) markLost(cause error) {
+	el.lostOnce.Do(func() {
+		el.mutex.Lock()
+		ch := el.ensureLostChan()
+		el.lostErr = cause
+		cancel := el.cancel
+		el.cancel = nil
+		el.ctx = nil
+		// Force the lock into a not-held state: the lease is gone, so the key
+		// has been (or will be) auto-deleted by etcd.
+		el.leaseID = 0
+		key := el.key
+		el.mutex.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+		close(ch)
+		// Drop from the manager so the renewal worker stops touching it.
+		globalLockManager.removeLock(el)
+		// Loss notification is optional: only callbacks that opt in by also
+		// implementing LockLostCallback receive it, so the base LockCallback
+		// interface stays backward compatible.
+		if lostCb, ok := currentCallback().(LockLostCallback); ok {
+			lostCb.OnLockLost(key, cause)
+		}
+	})
 }
 
 // Default configurations

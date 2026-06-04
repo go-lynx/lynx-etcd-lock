@@ -3,6 +3,7 @@ package etcdlock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -95,13 +96,44 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 		rctx, cancel := context.WithTimeout(context.Background(), to)
 		defer cancel()
 		if releaseErr := lock.Release(rctx); releaseErr != nil {
+			// When the lock was lost, retErr already wraps ErrLockLost and Release
+			// returns ErrLockLost too; don't join it again (and don't add
+			// ErrLockNotHeld noise). Keep the returned error clean while still
+			// detectable via errors.Is(err, ErrLockLost).
+			if errors.Is(retErr, ErrLockLost) && errors.Is(releaseErr, ErrLockLost) {
+				return
+			}
 			log.ErrorCtx(ctx, "failed to release etcd lock", "error", releaseErr)
 			retErr = errors.Join(retErr, releaseErr)
 		}
 	}()
 
-	// Execute user function
-	return fn()
+	// Execute the user function while watching for lock loss. If the lease
+	// expires / renewal fails terminally (lock.Done() closes), we must abort
+	// rather than let fn() run to completion: otherwise this node would keep
+	// executing the critical section after another node could have acquired the
+	// lock. Run fn() in a goroutine and race it against the lost signal.
+	fnDone := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fnDone <- fmt.Errorf("lock callback panicked: %v", r)
+			}
+		}()
+		fnDone <- fn()
+	}()
+
+	select {
+	case err := <-fnDone:
+		return err
+	case <-lock.Done():
+		lostErr := lock.LostErr()
+		if lostErr == nil {
+			lostErr = ErrLockLost
+		}
+		log.ErrorCtx(ctx, "etcd lock lost during critical section", "key", key, "error", lostErr)
+		return errors.Join(ErrLockLost, lostErr)
+	}
 }
 
 // LockWithRetry acquires lock and executes function, supports retry by strategy.

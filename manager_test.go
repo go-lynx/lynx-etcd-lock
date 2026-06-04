@@ -15,6 +15,7 @@ type recordingCallback struct {
 	release  int
 	renew    int
 	failures int
+	lost     int
 }
 
 func (c *recordingCallback) OnLockAcquired(string, time.Duration) {
@@ -44,6 +45,12 @@ func (c *recordingCallback) OnLockRenewalFailed(string, error) {
 func (c *recordingCallback) OnLockAcquireFailed(string, error) {
 	c.mu.Lock()
 	c.failures++
+	c.mu.Unlock()
+}
+
+func (c *recordingCallback) OnLockLost(string, error) {
+	c.mu.Lock()
+	c.lost++
 	c.mu.Unlock()
 }
 
