@@ -21,7 +21,54 @@ var (
 	ErrMaxRetriesExceeded = errors.New("max retries exceeded")
 	// ErrLockFnRequired indicates callback function is required
 	ErrLockFnRequired = errors.New("lock callback function is required")
+	// ErrLockAlreadyHeld indicates Acquire was called on a lock that is already held
+	ErrLockAlreadyHeld = errors.New("lock already held by this instance")
+	// ErrLockLost indicates the lock was permanently lost (lease expired / renewal failed)
+	ErrLockLost = errors.New("lock lost")
 )
+
+// leaseTTLSeconds converts a lock expiration into the integer-second TTL etcd
+// leases require. etcd lease granularity is whole seconds, so any sub-second
+// component is rounded UP to avoid the lease expiring before the renewal math
+// (which uses the full duration) fires.
+func leaseTTLSeconds(expiration time.Duration) int64 {
+	secs := expiration / time.Second
+	if expiration%time.Second != 0 {
+		secs++
+	}
+	if secs < 1 {
+		secs = 1
+	}
+	return int64(secs)
+}
+
+// revokeLease best-effort revokes a lease, retrying a few times. A failed
+// revoke leaves the lock held until the lease TTL elapses, so the failure is
+// logged rather than silently ignored. Returns the last revoke error (nil on
+// success) so callers can decide how to react.
+func revokeLease(client *clientv3.Client, leaseID clientv3.LeaseID, key string) error {
+	if client == nil || leaseID == 0 {
+		return nil
+	}
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, lastErr = client.Revoke(revokeCtx, leaseID)
+		revokeCancel()
+		if lastErr == nil {
+			return nil
+		}
+		log.WarnCtx(context.Background(), "failed to revoke etcd lease",
+			"key", key, "lease", int64(leaseID), "attempt", i+1, "error", lastErr)
+		if i < attempts-1 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	log.ErrorCtx(context.Background(), "etcd lease revoke failed after retries; lock held until TTL",
+		"key", key, "lease", int64(leaseID), "error", lastErr)
+	return lastErr
+}
 
 // GetKey gets the lock key name
 func (el *EtcdLock) GetKey() string {
@@ -143,21 +190,36 @@ func (el *EtcdLock) Release(ctx context.Context) (releaseErr error) {
 	el.mutex.Lock()
 	leaseID := el.leaseID
 	cancel := el.cancel
+	lost := el.lostErr != nil
 	el.mutex.Unlock()
 
 	if leaseID == 0 {
+		// If the lock was permanently lost, markLost already zeroed leaseID and
+		// dropped the lease (etcd auto-deletes the key). Report the loss rather
+		// than ErrLockNotHeld so the deferred Release in LockWithOptions does not
+		// add ErrLockNotHeld noise alongside the ErrLockLost the caller already
+		// gets. Callers still detect the loss via errors.Is(err, ErrLockLost),
+		// and this never reports a clean release.
+		if lost {
+			return ErrLockLost
+		}
 		return ErrLockNotHeld
 	}
 
-	// Revoke the lease to release the lock
-	_, err = client.Revoke(ctx, leaseID)
-	if err != nil {
-		return fmt.Errorf("failed to revoke lease: %w", err)
-	}
-
+	// Revoke the lease to release the lock. Stop the keepAlive goroutine first
+	// so it cannot race the revoke or keep extending the lease we are dropping.
 	if cancel != nil {
 		cancel()
 	}
+
+	if _, err = client.Revoke(ctx, leaseID); err != nil {
+		// Do NOT zero leaseID on failure: the lock is still held (until TTL),
+		// so the caller must be able to retry Release. Retry in the background
+		// to best-effort drop the lease rather than waiting the full TTL.
+		go revokeLease(client, leaseID, el.key)
+		return fmt.Errorf("failed to revoke lease: %w", err)
+	}
+
 	globalLockManager.removeLock(el)
 
 	el.mutex.Lock()
@@ -206,10 +268,22 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 		observeOperationLatency("lock", operationStatus(acquireErr), time.Since(start))
 	}()
 
+	// Guard against double-acquire on the same instance: a second Acquire would
+	// otherwise overwrite leaseID/cancel and orphan the previous lease and its
+	// keepAlive goroutine. Reject re-acquire while the lock is still held.
+	el.mutex.Lock()
+	if el.leaseID != 0 {
+		el.mutex.Unlock()
+		currentCallback().OnLockAcquireFailed(el.key, ErrLockAlreadyHeld)
+		return ErrLockAlreadyHeld
+	}
+	el.mutex.Unlock()
+
 	lockKey := buildLockKey(el.key)
 
-	// Create lease
-	lease, err := client.Grant(ctx, int64(el.expiration.Seconds()))
+	// Create lease. Round the TTL up to whole seconds so the lease never expires
+	// before the renewal logic (which uses the full sub-second duration) runs.
+	lease, err := client.Grant(ctx, leaseTTLSeconds(el.expiration))
 	if err != nil {
 		currentCallback().OnLockAcquireFailed(el.key, err)
 		return fmt.Errorf("failed to grant lease: %w", err)
@@ -223,17 +297,13 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 
 	txnResp, err := txn.Commit()
 	if err != nil {
-		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		client.Revoke(revokeCtx, lease.ID)
-		revokeCancel()
+		revokeLease(client, lease.ID, el.key)
 		currentCallback().OnLockAcquireFailed(el.key, err)
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	if !txnResp.Succeeded {
-		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		client.Revoke(revokeCtx, lease.ID)
-		revokeCancel()
+		revokeLease(client, lease.ID, el.key)
 		currentCallback().OnLockAcquireFailed(el.key, ErrLockAcquireConflict)
 		return ErrLockAcquireConflict
 	}
@@ -291,8 +361,29 @@ func (el *EtcdLock) AcquireWithRetry(ctx context.Context, strategy RetryStrategy
 	}
 }
 
-// keepAlive keeps the lease alive
+// keepAlive keeps the lease alive. It recovers from panics so a failure in the
+// etcd client can never crash the process, backs off exponentially between
+// reconnection attempts, and signals terminal lock loss (via markLost) once the
+// lease can no longer be kept alive.
 func (el *EtcdLock) keepAlive() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.ErrorCtx(context.Background(), "keepAlive goroutine panicked", "key", el.key, "panic", r)
+			el.markLost(fmt.Errorf("keepAlive panic: %v", r))
+		}
+	}()
+
+	const (
+		baseBackoff = 50 * time.Millisecond
+		maxBackoff  = 5 * time.Second
+		// maxKeepAliveFailures bounds reconnection attempts. Once the lease TTL
+		// has almost certainly elapsed without a successful keep-alive, the lock
+		// is considered permanently lost.
+		maxKeepAliveFailures = 6
+	)
+	backoff := baseBackoff
+	failures := 0
+
 	for {
 		el.mutex.Lock()
 		ctx := el.ctx
@@ -305,35 +396,72 @@ func (el *EtcdLock) keepAlive() {
 		client, err := el.currentClient(ctx)
 		if err != nil {
 			log.ErrorCtx(ctx, "failed to resolve etcd client for keep alive", "error", err)
-			return
+			if failures++; failures >= maxKeepAliveFailures {
+				el.markLost(fmt.Errorf("keep alive: resolve client failed: %w", err))
+				return
+			}
+			if !waitForRetryDelay(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff, maxBackoff)
+			continue
 		}
 		ch, kaErr := client.KeepAlive(ctx, leaseID)
 		if kaErr != nil {
 			log.ErrorCtx(ctx, "failed to start keep alive", "error", kaErr)
-			return
+			if failures++; failures >= maxKeepAliveFailures {
+				el.markLost(fmt.Errorf("keep alive: start failed: %w", kaErr))
+				return
+			}
+			if !waitForRetryDelay(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff, maxBackoff)
+			continue
 		}
 
-		for {
+		channelClosed := false
+		for !channelClosed {
 			select {
 			case <-ctx.Done():
 				return
 			case ka, ok := <-ch:
 				if !ok {
 					log.WarnCtx(ctx, "keep alive channel closed", "key", el.key)
-					if !waitForRetryDelay(ctx, 50*time.Millisecond) {
-						return
-					}
-					goto retryKeepAlive
+					channelClosed = true
+					break
 				}
 				if ka != nil {
+					// Successful keep-alive: lease renewed, reset failure state.
+					failures = 0
+					backoff = baseBackoff
 					el.mutex.Lock()
 					el.expiresAt = time.Now().Add(time.Duration(ka.TTL) * time.Second)
 					el.mutex.Unlock()
 				}
 			}
 		}
-	retryKeepAlive:
+
+		// Channel closed: the lease may have been lost. Back off and retry,
+		// giving up (and signalling terminal loss) after repeated failures.
+		if failures++; failures >= maxKeepAliveFailures {
+			el.markLost(ErrLockRenewalFailed)
+			return
+		}
+		if !waitForRetryDelay(ctx, backoff) {
+			return
+		}
+		backoff = nextBackoff(backoff, maxBackoff)
 	}
+}
+
+// nextBackoff doubles the current backoff up to a ceiling.
+func nextBackoff(current, max time.Duration) time.Duration {
+	next := current * 2
+	if next > max {
+		return max
+	}
+	return next
 }
 
 // NewLock creates a reusable lock instance

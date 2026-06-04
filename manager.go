@@ -158,6 +158,16 @@ func (lm *lockManager) processRenewals(options LockOptions) {
 		case lm.workerPool <- struct{}{}:
 			go func(l *EtcdLock) {
 				defer func() { <-lm.workerPool }()
+				// Recover so a panic in renewal (e.g. inside the etcd client)
+				// cannot crash the whole process. A panicking renewal means we
+				// can no longer guarantee the lock, so treat it as a loss.
+				defer func() {
+					if r := recover(); r != nil {
+						log.ErrorCtx(context.Background(), "lock renewal worker panicked",
+							"key", l.key, "panic", r)
+						l.markLost(fmt.Errorf("renewal worker panic: %v", r))
+					}
+				}()
 				lm.renewLockWithRetry(l, options)
 			}(lock)
 		default:
@@ -201,7 +211,11 @@ func (lm *lockManager) renewLockWithRetry(lock *EtcdLock, options LockOptions) {
 		}
 	}
 
-	lm.removeLock(lock)
+	// Terminal renewal failure: the lease has (or will) expire and etcd will
+	// auto-delete the key, so the lock is permanently lost. markLost cancels the
+	// holder, forces a not-held state, drops it from the manager and notifies the
+	// caller via Done()/OnLockLost so two nodes cannot run the critical section.
+	lock.markLost(ErrLockRenewalFailed)
 
 	log.ErrorCtx(context.Background(), "lock renewal failed after retries",
 		"key", lock.key, "retries", maxRetries)
