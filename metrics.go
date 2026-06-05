@@ -54,9 +54,31 @@ func ensureMetricsRegistered() {
 			}
 		}
 
-		prometheus.MustRegister(
-			lockOperationTotal,
-			lockOperationDur,
+		// Register each collector individually so that re-importing this package
+		// in a single test binary (multiple test packages linked together) does
+		// not panic via MustRegister. On AlreadyRegisteredError we use the
+		// previously registered instance to keep the active metric variables
+		// pointing at the live collectors.
+		if err := prometheus.DefaultRegisterer.Register(lockOperationTotal); err != nil {
+			var are prometheus.AlreadyRegisteredError
+			if !errors.As(err, &are) {
+				panic(err)
+			}
+			if existing, ok := are.ExistingCollector.(*prometheus.CounterVec); ok {
+				lockOperationTotal = existing
+			}
+		}
+		if err := prometheus.DefaultRegisterer.Register(lockOperationDur); err != nil {
+			var are prometheus.AlreadyRegisteredError
+			if !errors.As(err, &are) {
+				panic(err)
+			}
+			if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+				lockOperationDur = existing
+			}
+		}
+
+		funcCollectors := []prometheus.Collector{
 			prometheus.NewGaugeFunc(
 				prometheus.GaugeOpts{
 					Namespace: metricsNamespace,
@@ -112,7 +134,15 @@ func ensureMetricsRegistered() {
 					return float64(atomic.LoadInt64(&globalLockManager.stats.SkippedRenewals))
 				},
 			),
-		)
+		}
+		for _, c := range funcCollectors {
+			if err := prometheus.DefaultRegisterer.Register(c); err != nil {
+				var are prometheus.AlreadyRegisteredError
+				if !errors.As(err, &are) {
+					panic(err)
+				}
+			}
+		}
 	})
 }
 

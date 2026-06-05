@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-lynx/lynx/log"
+	"github.com/go-lynx/lynx/pkg/timex"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -62,7 +63,7 @@ func revokeLease(client *clientv3.Client, leaseID clientv3.LeaseID, key string) 
 		log.WarnCtx(context.Background(), "failed to revoke etcd lease",
 			"key", key, "lease", int64(leaseID), "attempt", i+1, "error", lastErr)
 		if i < attempts-1 {
-			time.Sleep(100 * time.Millisecond)
+			waitForRetryDelay(context.Background(), 100*time.Millisecond)
 		}
 	}
 	log.ErrorCtx(context.Background(), "etcd lease revoke failed after retries; lock held until TTL",
@@ -97,36 +98,36 @@ func (el *EtcdLock) currentClient(ctx context.Context) (*clientv3.Client, error)
 
 // GetExpiration gets the lock expiration time
 func (el *EtcdLock) GetExpiration() time.Duration {
-	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	el.mutex.RLock()
+	defer el.mutex.RUnlock()
 	return el.expiration
 }
 
 // GetExpiresAt gets the lock expiration time point
 func (el *EtcdLock) GetExpiresAt() time.Time {
-	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	el.mutex.RLock()
+	defer el.mutex.RUnlock()
 	return el.expiresAt
 }
 
 // GetAcquiredAt gets the lock acquisition time
 func (el *EtcdLock) GetAcquiredAt() time.Time {
-	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	el.mutex.RLock()
+	defer el.mutex.RUnlock()
 	return el.acquiredAt
 }
 
 // GetRemainingTime gets the remaining time of the lock
 func (el *EtcdLock) GetRemainingTime() time.Duration {
-	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	el.mutex.RLock()
+	defer el.mutex.RUnlock()
 	return time.Until(el.expiresAt)
 }
 
 // IsExpired checks if the lock has expired
 func (el *EtcdLock) IsExpired() bool {
-	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	el.mutex.RLock()
+	defer el.mutex.RUnlock()
 	return time.Now().After(el.expiresAt)
 }
 
@@ -142,9 +143,9 @@ func (el *EtcdLock) Renew(ctx context.Context, newExpiration time.Duration) (ren
 		observeOperationLatency("renew", operationStatus(renewErr), time.Since(start))
 	}()
 
-	el.mutex.Lock()
+	el.mutex.RLock()
 	leaseID := el.leaseID
-	el.mutex.Unlock()
+	el.mutex.RUnlock()
 
 	if leaseID == 0 {
 		return ErrLockNotHeld
@@ -216,7 +217,21 @@ func (el *EtcdLock) Release(ctx context.Context) (releaseErr error) {
 		// Do NOT zero leaseID on failure: the lock is still held (until TTL),
 		// so the caller must be able to retry Release. Retry in the background
 		// to best-effort drop the lease rather than waiting the full TTL.
-		go revokeLease(client, leaseID, el.key)
+		// On eventual success, clean up in-process state so the manager stops
+		// renewing and future Release calls return ErrLockNotHeld rather than
+		// looping forever.
+		go func() {
+			if revokeLease(client, leaseID, el.key) == nil {
+				globalLockManager.removeLock(el)
+				el.mutex.Lock()
+				if el.leaseID == leaseID { // guard against a concurrent re-acquire on the same instance
+					el.leaseID = 0
+					el.cancel = nil
+					el.ctx = nil
+				}
+				el.mutex.Unlock()
+			}
+		}()
 		return fmt.Errorf("failed to revoke lease: %w", err)
 	}
 
@@ -239,9 +254,9 @@ func (el *EtcdLock) IsLocked(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	el.mutex.Lock()
+	el.mutex.RLock()
 	leaseID := el.leaseID
-	el.mutex.Unlock()
+	el.mutex.RUnlock()
 
 	if leaseID == 0 {
 		return false, nil
@@ -329,26 +344,26 @@ func (el *EtcdLock) Acquire(ctx context.Context) (acquireErr error) {
 	return nil
 }
 
-// AcquireWithRetry acquires the lock and retries according to strategy
+// AcquireWithRetry acquires the lock and retries according to strategy.
+// A ±50% jitter is applied to each retry delay so that contending callers
+// do not retry in lockstep (thundering herd).
 func (el *EtcdLock) AcquireWithRetry(ctx context.Context, strategy RetryStrategy) error {
 	retries := 0
 	for {
 		if strategy.MaxRetries > 0 && retries >= strategy.MaxRetries {
 			return ErrMaxRetriesExceeded
 		}
-		if retries > 0 {
-			delay := strategy.RetryDelay
-			if delay > 0 {
-				if !waitForRetryDelay(ctx, delay) {
-					return ctx.Err()
-				}
+		if retries > 0 && strategy.RetryDelay > 0 {
+			delay := timex.JitterAround(strategy.RetryDelay, 0.5)
+			if !waitForRetryDelay(ctx, delay) {
+				return ctx.Err()
 			}
 		}
 		err := el.Acquire(ctx)
 		if err == nil {
 			return nil
 		}
-		if err != ErrLockAcquireConflict {
+		if !errors.Is(err, ErrLockAcquireConflict) {
 			return err
 		}
 		// Only contention is retryable; with no retry budget, report the conflict.
@@ -383,10 +398,10 @@ func (el *EtcdLock) keepAlive() {
 	failures := 0
 
 	for {
-		el.mutex.Lock()
+		el.mutex.RLock()
 		ctx := el.ctx
 		leaseID := el.leaseID
-		el.mutex.Unlock()
+		el.mutex.RUnlock()
 		if ctx == nil || leaseID == 0 {
 			return
 		}

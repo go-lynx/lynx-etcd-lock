@@ -57,20 +57,52 @@ func (lm *lockManager) startRenewalService(options LockOptions) {
 	lm.workerPool = make(chan struct{}, workerPoolSize)
 	lm.mutex.Unlock()
 
+	checkInterval := options.RenewalConfig.CheckInterval
+	if checkInterval <= 0 {
+		checkInterval = DefaultRenewalConfig.CheckInterval
+	}
+
 	go func() {
-		checkInterval := options.RenewalConfig.CheckInterval
-		if checkInterval <= 0 {
-			checkInterval = DefaultRenewalConfig.CheckInterval
-		}
-		ticker := time.NewTicker(checkInterval)
-		defer ticker.Stop()
+		// Mark the service as stopped when this goroutine exits (normal shutdown or after unrecoverable error).
+		defer func() {
+			lm.mutex.Lock()
+			lm.running = false
+			lm.mutex.Unlock()
+		}()
+
+		// Capture the context once so restarts after a panic still respect the same cancel signal.
+		lm.mutex.RLock()
+		renewCtx := lm.renewCtx
+		lm.mutex.RUnlock()
 
 		for {
+			// Run one ticker epoch inside a nested closure so a panic can be recovered
+			// without killing the goroutine; the outer loop then restarts.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.ErrorCtx(context.Background(), "panic in renewal service goroutine", "recover", r)
+					}
+				}()
+				ticker := time.NewTicker(checkInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						lm.processRenewals(options)
+					case <-renewCtx.Done():
+						return
+					}
+				}
+			}()
+
+			// Inner closure returned: either context cancelled (clean shutdown) or panic recovered.
 			select {
-			case <-ticker.C:
-				lm.processRenewals(options)
-			case <-lm.renewCtx.Done():
+			case <-renewCtx.Done():
 				return
+			default:
+				log.ErrorCtx(context.Background(), "renewal service restarting after panic recovery")
+				waitForRetryDelay(renewCtx, 200*time.Millisecond)
 			}
 		}
 	}()
@@ -81,12 +113,10 @@ func (lm *lockManager) addManagedLock(lock *EtcdLock) {
 		return
 	}
 	lm.mutex.Lock()
-	existing, exists := lm.locks[lock.key]
+	_, exists := lm.locks[lock.key]
 	lm.locks[lock.key] = lock
 	if !exists {
 		atomic.AddInt64(&lm.stats.ActiveLocks, 1)
-		atomic.AddInt64(&lm.stats.TotalLocks, 1)
-	} else if existing != lock {
 		atomic.AddInt64(&lm.stats.TotalLocks, 1)
 	}
 	lm.mutex.Unlock()
@@ -138,11 +168,11 @@ func (lm *lockManager) processRenewals(options LockOptions) {
 	locksToRenew := make([]*EtcdLock, 0, len(lm.locks))
 
 	for _, lock := range lm.locks {
-		lock.mutex.Lock()
+		lock.mutex.RLock()
 		expiresAtSnap := lock.expiresAt
 		expirationSnap := lock.expiration
 		thresholdSnap := lock.renewalThreshold
-		lock.mutex.Unlock()
+		lock.mutex.RUnlock()
 
 		thresholdDur := time.Duration(float64(expirationSnap) * thresholdSnap)
 		if time.Until(expiresAtSnap) <= thresholdDur {
@@ -230,12 +260,12 @@ func (lm *lockManager) renewLock(ctx context.Context, lock *EtcdLock) error {
 		return err
 	}
 
-	lock.mutex.Lock()
+	lock.mutex.RLock()
 	expiresAtSnap := lock.expiresAt
 	expirationSnap := lock.expiration
 	thresholdSnap := lock.renewalThreshold
 	leaseID := lock.leaseID
-	lock.mutex.Unlock()
+	lock.mutex.RUnlock()
 
 	if time.Until(expiresAtSnap) > time.Duration(float64(expirationSnap)*thresholdSnap) {
 		return nil
@@ -300,21 +330,20 @@ func GetStats() map[string]int64 {
 }
 
 // Shutdown gracefully shuts down the lock manager.
-// Waits for all managed locks to be released (or timeout).
+// It stops the renewal service and polls until all active locks are released or the
+// context is cancelled. Callers control the deadline via ctx — e.g.:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+//	defer cancel()
+//	_ = etcdlock.Shutdown(ctx)
 func Shutdown(ctx context.Context) error {
 	globalLockManager.stopRenewalService()
 
-	timeout := time.After(10 * time.Second)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-timeout:
-			globalLockManager.mutex.RLock()
-			n := len(globalLockManager.locks)
-			globalLockManager.mutex.RUnlock()
-			return fmt.Errorf("shutdown timeout, %d locks still active", n)
 		case <-ticker.C:
 			globalLockManager.mutex.RLock()
 			n := len(globalLockManager.locks)
@@ -323,7 +352,13 @@ func Shutdown(ctx context.Context) error {
 				return nil
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			globalLockManager.mutex.RLock()
+			n := len(globalLockManager.locks)
+			globalLockManager.mutex.RUnlock()
+			if n == 0 {
+				return nil
+			}
+			return fmt.Errorf("shutdown cancelled with %d locks still active: %w", n, ctx.Err())
 		}
 	}
 }

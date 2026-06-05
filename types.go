@@ -123,7 +123,7 @@ type EtcdLock struct {
 	leaseID          clientv3.LeaseID
 	expiration       time.Duration
 	expiresAt        time.Time
-	mutex            sync.Mutex
+	mutex            sync.RWMutex
 	renewalThreshold float64
 	renewalEnabled   bool
 	acquiredAt       time.Time
@@ -156,8 +156,8 @@ func (el *EtcdLock) Done() <-chan struct{} {
 // LostErr returns the error that caused the lock to be lost, or nil if the
 // lock has not been lost.
 func (el *EtcdLock) LostErr() error {
-	el.mutex.Lock()
-	defer el.mutex.Unlock()
+	el.mutex.RLock()
+	defer el.mutex.RUnlock()
 	return el.lostErr
 }
 

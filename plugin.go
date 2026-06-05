@@ -151,7 +151,6 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 	p.client = nil
 	p.rt = nil
 	resetClientProvider()
-	GetEtcdClient = func() *clientv3.Client { return nil }
 	atomic.StoreInt32(&p.initialized, 0)
 	atomic.StoreInt32(&p.destroyed, 1)
 	log.Infof("Etcd lock plugin cleanup completed")

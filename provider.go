@@ -26,6 +26,10 @@ type Provider interface {
 	NewLock(ctx context.Context, key string, options LockOptions) (*EtcdLock, error)
 	Lock(ctx context.Context, key string, expiration time.Duration, fn func() error) error
 	LockWithOptions(ctx context.Context, key string, options LockOptions, fn func() error) error
+	// LockWithOptionsCtx is like LockWithOptions but passes a lock-scoped context
+	// to fn; the context is cancelled when the lock is permanently lost so fn can
+	// abort its critical section gracefully via ctx.Err().
+	LockWithOptionsCtx(ctx context.Context, key string, options LockOptions, fn func(context.Context) error) error
 }
 
 type provider struct{}
@@ -73,6 +77,10 @@ func (provider) Lock(ctx context.Context, key string, expiration time.Duration, 
 
 func (provider) LockWithOptions(ctx context.Context, key string, options LockOptions, fn func() error) error {
 	return LockWithOptions(ctx, key, options, fn)
+}
+
+func (provider) LockWithOptionsCtx(ctx context.Context, key string, options LockOptions, fn func(context.Context) error) error {
+	return LockWithOptionsCtx(ctx, key, options, fn)
 }
 
 func resolveClientProvider() (ClientProvider, error) {

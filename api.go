@@ -57,10 +57,12 @@ func Lock(ctx context.Context, key string, expiration time.Duration, fn func() e
 	return LockWithOptions(ctx, key, options, fn)
 }
 
-// LockWithOptions acquires the lock with the given options, runs fn while holding
-// it, and always releases on return. If the lock is lost mid-section (see the
-// fn-vs-Done race below) fn is abandoned and an ErrLockLost-wrapped error returns.
-func LockWithOptions(ctx context.Context, key string, options LockOptions, fn func() error) (retErr error) {
+// LockWithOptionsCtx acquires the lock with the given options, runs fn(lockCtx) while
+// holding it, and always releases on return. lockCtx is derived from ctx and is
+// additionally cancelled when the lock is permanently lost, giving fn a chance to abort
+// its critical section via context cancellation. After cancelling lockCtx,
+// LockWithOptionsCtx waits up to OperationTimeout for fn to return before moving on.
+func LockWithOptionsCtx(ctx context.Context, key string, options LockOptions, fn func(context.Context) error) (retErr error) {
 	if fn == nil {
 		return ErrLockFnRequired
 	}
@@ -96,9 +98,7 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 		defer cancel()
 		if releaseErr := lock.Release(rctx); releaseErr != nil {
 			// When the lock was lost, retErr already wraps ErrLockLost and Release
-			// returns ErrLockLost too; don't join it again (and don't add
-			// ErrLockNotHeld noise). Keep the returned error clean while still
-			// detectable via errors.Is(err, ErrLockLost).
+			// returns ErrLockLost too; don't join it again.
 			if errors.Is(retErr, ErrLockLost) && errors.Is(releaseErr, ErrLockLost) {
 				return
 			}
@@ -107,11 +107,12 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 		}
 	}()
 
-	// Execute the user function while watching for lock loss. If the lease
-	// expires / renewal fails terminally (lock.Done() closes), we must abort
-	// rather than let fn() run to completion: otherwise this node would keep
-	// executing the critical section after another node could have acquired the
-	// lock. Run fn() in a goroutine and race it against the lost signal.
+	// lockCtx is cancelled when the lock is permanently lost, giving fn a chance
+	// to detect the loss via ctx.Err() and abort its critical section gracefully.
+	lockCtx, lockCancel := context.WithCancel(ctx)
+	defer lockCancel()
+
+	// Run fn in a goroutine so we can race it against lock loss.
 	fnDone := make(chan error, 1)
 	go func() {
 		defer func() {
@@ -119,20 +120,43 @@ func LockWithOptions(ctx context.Context, key string, options LockOptions, fn fu
 				fnDone <- fmt.Errorf("lock callback panicked: %v", r)
 			}
 		}()
-		fnDone <- fn()
+		fnDone <- fn(lockCtx)
 	}()
 
 	select {
 	case err := <-fnDone:
 		return err
 	case <-lock.Done():
+		lockCancel() // signal fn to abort via context
 		lostErr := lock.LostErr()
 		if lostErr == nil {
 			lostErr = ErrLockLost
 		}
 		log.ErrorCtx(ctx, "etcd lock lost during critical section", "key", key, "error", lostErr)
+		// Wait for fn to observe the cancellation and exit (bounded to prevent goroutine leak).
+		to := options.OperationTimeout
+		if to <= 0 {
+			to = DefaultLockOptions.OperationTimeout
+		}
+		timer := time.NewTimer(to)
+		defer timer.Stop()
+		select {
+		case <-fnDone:
+		case <-timer.C:
+			log.ErrorCtx(ctx, "fn did not stop within timeout after lock loss", "key", key)
+		}
 		return errors.Join(ErrLockLost, lostErr)
 	}
+}
+
+// LockWithOptions acquires the lock with the given options, runs fn while holding
+// it, and always releases on return. If the lock is lost mid-section fn is aborted
+// and an ErrLockLost-wrapped error is returned.
+func LockWithOptions(ctx context.Context, key string, options LockOptions, fn func() error) error {
+	if fn == nil {
+		return ErrLockFnRequired
+	}
+	return LockWithOptionsCtx(ctx, key, options, func(_ context.Context) error { return fn() })
 }
 
 // LockWithRetry is Lock with a caller-supplied retry strategy for contention.
