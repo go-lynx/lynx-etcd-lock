@@ -15,7 +15,7 @@ import (
 
 const (
 	pluginName        = "etcd.distributed.lock"
-	pluginVersion     = "v1.6.1"
+	pluginVersion     = "v1.6.3"
 	pluginDescription = "etcd distributed lock plugin for lynx framework"
 	confPrefix        = "lynx.etcd-lock"
 )
