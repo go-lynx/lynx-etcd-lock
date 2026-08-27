@@ -33,7 +33,7 @@ lynx:
 import (
     "context"
     "time"
-    "github.com/go-lynx/lynx/plugins/etcd-lock"
+    "github.com/go-lynx/lynx-etcd-lock"
 )
 
 // Simple usage

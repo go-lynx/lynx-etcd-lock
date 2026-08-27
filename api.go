@@ -37,7 +37,11 @@ func currentCallback() LockCallback {
 }
 
 // GetEtcdClient gets the current etcd client through the registered provider.
-var GetEtcdClient = func() *clientv3.Client {
+// It is a variable so tests can stub it; CleanupTasks restores the default.
+var GetEtcdClient = defaultGetEtcdClient
+
+// defaultGetEtcdClient resolves the client through the registered provider.
+func defaultGetEtcdClient() *clientv3.Client {
 	provider := GetClientProvider()
 	if provider == nil {
 		return nil

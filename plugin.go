@@ -2,6 +2,7 @@ package etcdlock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -97,7 +98,24 @@ func (p *PlugEtcdLock) GetDependencies() []plugins.Dependency {
 
 // StartupTasks publishes the lock provider as a runtime resource so other
 // plugins can acquire locks. Idempotent and safe once the client is present.
+// It is the legacy (non-cancellable) entrypoint and delegates to
+// StartupTasksContext with a background context.
 func (p *PlugEtcdLock) StartupTasks() error {
+	return p.StartupTasksContext(context.Background())
+}
+
+// StartupTasksContext publishes the lock provider as a runtime resource while
+// honoring ctx. Startup does no network I/O (the etcd client is borrowed from
+// the config-centre plugin), so ctx is checked between the registration steps
+// and the plugin is only marked initialized when ctx is still live.
+func (p *PlugEtcdLock) StartupTasksContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("etcd lock startup canceled before execution: %w", err)
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -111,10 +129,16 @@ func (p *PlugEtcdLock) StartupTasks() error {
 	if p.client == nil {
 		return fmt.Errorf("etcd client is nil")
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("etcd lock startup canceled: %w", err)
+	}
 
 	if p.rt != nil {
 		lockProvider := GetProvider()
 		for _, resourceName := range []string{pluginName, pluginName + ".provider"} {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("etcd lock startup canceled while registering resources: %w", err)
+			}
 			if err := p.rt.RegisterSharedResource(resourceName, lockProvider); err != nil {
 				log.Warnf("failed to register etcd lock shared resource %s: %v", resourceName, err)
 			}
@@ -127,14 +151,35 @@ func (p *PlugEtcdLock) StartupTasks() error {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("etcd lock startup canceled before marking initialized: %w", err)
+	}
+
 	atomic.StoreInt32(&p.initialized, 1)
 	log.Infof("Etcd lock plugin started successfully")
 	return nil
 }
 
 // CleanupTasks drains the renewal manager (waiting up to 10s for in-flight locks
-// to release), clears the borrowed client, and tears down the provider.
+// to release), clears the borrowed client, and tears down the provider. It is
+// the legacy (non-cancellable) entrypoint and delegates to CleanupTasksContext
+// with a background context.
 func (p *PlugEtcdLock) CleanupTasks() error {
+	return p.CleanupTasksContext(context.Background())
+}
+
+// CleanupTasksContext drains the renewal manager while honoring ctx (the drain
+// is bounded by ctx and a 10s cap), then clears the borrowed client and tears
+// down the provider. If ctx expires during the drain, the plugin is still torn
+// down (so no new locks can be created) and the ctx error is returned.
+func (p *PlugEtcdLock) CleanupTasksContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("etcd lock cleanup canceled before execution: %w", err)
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -142,17 +187,26 @@ func (p *PlugEtcdLock) CleanupTasks() error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	drainCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := Shutdown(ctx); err != nil {
-		log.Warnf("Failed to shutdown lock manager: %v", err)
+	shutdownErr := Shutdown(drainCtx)
+	if shutdownErr != nil {
+		log.Warnf("Failed to shutdown lock manager: %v", shutdownErr)
 	}
 
 	p.client = nil
 	p.rt = nil
 	resetClientProvider()
+	// Restore the default getter so any stubbed getter no longer hands out a
+	// client after cleanup; the reset provider makes it return nil.
+	GetEtcdClient = defaultGetEtcdClient
 	atomic.StoreInt32(&p.initialized, 0)
 	atomic.StoreInt32(&p.destroyed, 1)
+
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("etcd lock cleanup canceled while draining locks: %w", errors.Join(err, shutdownErr))
+	}
+
 	log.Infof("Etcd lock plugin cleanup completed")
 	return nil
 }

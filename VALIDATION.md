@@ -12,7 +12,7 @@ go vet ./...
 Output:
 
 ```text
-ok  	github.com/go-lynx/lynx/plugins/etcd-lock
+ok  	github.com/go-lynx/lynx-etcd-lock
 ```
 
 ## What This Means
